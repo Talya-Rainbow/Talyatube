@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: anitube
+    runtime: python
+    plan: free
+    buildCommand: "true"
+    startCommand: python3 server.py
+    envVars:
+      - key: PORT
+        value: 10000
