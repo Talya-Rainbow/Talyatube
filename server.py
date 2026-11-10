@@ -20,41 +20,171 @@ from urllib.parse import parse_qs, urlparse, unquote
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-UPLOADS = ROOT / "uploads"
-DATA = ROOT / "data"
-DB_FILE = DATA / "db.json"
+# Use env dirs so Render persistent disk (or any mounted volume) keeps data forever
+DATA = Path(os.environ.get("DATA_DIR") or (ROOT / "data"))
+UPLOADS = Path(os.environ.get("UPLOAD_DIR") or (ROOT / "uploads"))
+DB_SQLITE = DATA / "talyatube.sqlite3"
+DB_JSON_LEGACY = DATA / "db.json"
 PORT = int(os.environ.get("PORT", "8081"))
+
+# Optional durable video storage (Cloudflare R2 / any S3-compatible bucket)
+# If set, uploaded videos go to the cloud instead of ephemeral disk
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
+R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "").strip().rstrip("/")  # e.g. https://pub-xxx.r2.dev
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").strip().rstrip("/")
+if not S3_ENDPOINT and R2_ACCOUNT_ID:
+    S3_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
 STATIC.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
 DATA.mkdir(exist_ok=True)
 
-# ---------- DB ----------
+# ---------- DB (SQLite — survives restarts if DATA_DIR is on persistent disk) ----------
+
+import sqlite3
+import threading
+
+_db_lock = threading.Lock()
+
 
 def default_db():
     return {"users": {}, "videos": [], "sessions": {}}
 
 
+def _sqlite_conn():
+    conn = sqlite3.connect(str(DB_SQLITE), check_same_thread=False)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+    )
+    conn.commit()
+    return conn
+
+
 def load_db():
-    if not DB_FILE.exists():
-        db = default_db()
-        save_db(db)
-        return db
-    try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            db = json.load(f)
-        for k, v in default_db().items():
-            db.setdefault(k, v)
-        return db
-    except Exception:
-        return default_db()
+    with _db_lock:
+        conn = _sqlite_conn()
+        try:
+            row = conn.execute("SELECT v FROM kv WHERE k='main'").fetchone()
+            if row:
+                db = json.loads(row[0])
+            elif DB_JSON_LEGACY.exists():
+                # one-time migrate from old json file
+                try:
+                    with open(DB_JSON_LEGACY, "r", encoding="utf-8") as f:
+                        db = json.load(f)
+                except Exception:
+                    db = default_db()
+                _save_db_unlocked(conn, db)
+            else:
+                db = default_db()
+                _save_db_unlocked(conn, db)
+            for k, v in default_db().items():
+                db.setdefault(k, v)
+            return db
+        finally:
+            conn.close()
+
+
+def _save_db_unlocked(conn, db):
+    payload = json.dumps(db, ensure_ascii=False)
+    conn.execute(
+        "INSERT INTO kv(k, v) VALUES('main', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (payload,),
+    )
+    conn.commit()
 
 
 def save_db(db):
-    tmp = DB_FILE.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2, ensure_ascii=False)
-    tmp.replace(DB_FILE)
+    with _db_lock:
+        conn = _sqlite_conn()
+        try:
+            _save_db_unlocked(conn, db)
+        finally:
+            conn.close()
+
+
+def _s3_enabled():
+    return bool(S3_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
+
+
+def store_file(key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
+    """Save file locally and/or to S3/R2. Returns public URL path or full URL."""
+    # Always keep a local copy when possible (dev / disk)
+    try:
+        dest = UPLOADS / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    except Exception:
+        pass
+
+    if _s3_enabled():
+        try:
+            _s3_put(key, data, content_type)
+            if R2_PUBLIC_BASE:
+                return f"{R2_PUBLIC_BASE}/{key}"
+            # path-style fallback through our server proxy is not available for remote-only
+            return f"{S3_ENDPOINT}/{R2_BUCKET}/{key}"
+        except Exception as e:
+            print("S3 upload failed, using local:", e)
+
+    return "/uploads/" + key
+
+
+def _s3_put(key: str, data: bytes, content_type: str):
+    """Minimal AWS Signature V4 PUT for S3-compatible APIs (R2)."""
+    import datetime
+    import hashlib
+    import hmac
+    from urllib.request import Request, urlopen
+
+    service = "s3"
+    region = os.environ.get("S3_REGION", "auto")
+    method = "PUT"
+    host = S3_ENDPOINT.replace("https://", "").replace("http://", "")
+    url = f"{S3_ENDPOINT}/{R2_BUCKET}/{key}"
+    t = datetime.datetime.utcnow()
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = t.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(data).hexdigest()
+    canonical_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    canonical_request = (
+        f"{method}\n/{R2_BUCKET}/{key}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        f"{algorithm}\n{amz_date}\n{credential_scope}\n"
+        + hashlib.sha256(canonical_request.encode()).hexdigest()
+    )
+
+    def _sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _sign(("AWS4" + R2_SECRET_ACCESS_KEY).encode("utf-8"), datestamp)
+    k_region = _sign(k_date, region)
+    k_service = _sign(k_region, service)
+    k_signing = _sign(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        f"{algorithm} Credential={R2_ACCESS_KEY_ID}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    req = Request(url, data=data, method="PUT")
+    req.add_header("Content-Type", content_type)
+    req.add_header("x-amz-content-sha256", payload_hash)
+    req.add_header("x-amz-date", amz_date)
+    req.add_header("Authorization", authorization)
+    with urlopen(req, timeout=120) as resp:
+        resp.read()
 
 
 def hash_pw(password: str, salt: str) -> str:
@@ -549,7 +679,8 @@ class Handler(BaseHTTPRequestHandler):
                 ext = ".mp4"
             vid = str(uuid.uuid4())[:12]
             stored_name = vid + ext
-            (UPLOADS / stored_name).write_bytes(data)
+            video_ct = file_ct or "video/mp4"
+            video_url = store_file(stored_name, data, video_ct)
             thumb_url = ""
             if thumb_data_url.startswith("data:image/") and len(thumb_data_url) < 2_500_000:
                 try:
@@ -557,8 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                     header, b64 = thumb_data_url.split(",", 1)
                     raw = base64.b64decode(b64)
                     tname = vid + ".jpg"
-                    (UPLOADS / tname).write_bytes(raw)
-                    thumb_url = "/uploads/" + tname
+                    thumb_url = store_file(tname, raw, "image/jpeg")
                 except Exception:
                     thumb_url = ""
             entry = {
@@ -568,7 +698,7 @@ class Handler(BaseHTTPRequestHandler):
                 "user_id": user["id"],
                 "channel": user.get("display_name") or user["username"],
                 "filename": stored_name,
-                "url": "/uploads/" + stored_name,
+                "url": video_url,
                 "thumbnail": thumb_url,
                 "is_short": is_short,
                 "created_at": int(time.time()),
